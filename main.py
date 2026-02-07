@@ -70,6 +70,15 @@ critical_cols = cols_to_numeric + ['latitude', 'longitude']
 existing_cols = [c for c in critical_cols if c in df.columns]
 df = df.dropna(subset=existing_cols)
 
+# Clear all values that are null
+df.dropna(inplace = True)
+
+# Filter outliers with sales price (family transfers/inheritances)
+for x in df.index:
+  if df.loc[x, "sale_price"] <= 10:
+    df.drop(x, inplace = True)
+
+
 print(f"Cleaned Shape: {df.shape}")
 
 # ---------------------------------------------------------
