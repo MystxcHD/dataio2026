@@ -11,8 +11,9 @@ def install(package):
     except subprocess.CalledProcessError as e:
         print(f"Error installing {package}: {e}")
 
-required_packages = ["scikit-learn", "pandas", "matplotlib", "numpy"]
+required_packages = ["scikit-learn", "pandas", "matplotlib", "numpy", "seaborn"]
 
+print("Checking environment...")
 for package in required_packages:
     try:
         __import__(package)
@@ -26,11 +27,13 @@ for package in required_packages:
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-from sklearn.linear_model import LinearRegression
+import seaborn as sns
+from sklearn.ensemble import GradientBoostingRegressor
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, r2_score
 
 # ---------------------------------------------------------
-# Step 2: Load Local Data
+# Step 2: Load Data
 # ---------------------------------------------------------
 workspace_folder = os.getcwd()
 csv_path = os.path.join(workspace_folder, "nyc_housing_base.csv")
@@ -41,7 +44,6 @@ if not os.path.exists(csv_path):
 
 print(f"Loading data from: {csv_path}")
 df = pd.read_csv(csv_path, encoding="latin1", engine="python")
-print(f"Original Shape: {df.shape}")
 
 # ---------------------------------------------------------
 # Step 3: Robust Cleaning
@@ -49,69 +51,171 @@ print(f"Original Shape: {df.shape}")
 # 1. Drop duplicates
 df = df.drop_duplicates()
 
-# 2. Force numeric types (Variable defined here as 'cols_to_numeric')
-cols_to_numeric = ['sale_price', 'bldgarea', 'yearbuilt']
-
+# 2. Force numeric types
+cols_to_numeric = ['sale_price', 'bldgarea', 'yearbuilt', 'unitsres', 'latitude', 'longitude']
 for col in cols_to_numeric:
     if col in df.columns:
         df[col] = pd.to_numeric(df[col], errors='coerce')
 
-# 3. Filter out "Impossible" Data
+# 3. CRITICAL FILTER: Single Family Homes Only
+# This fixes the "Weird Graph" issue (Apartments vs Whole Buildings)
+if 'unitsres' in df.columns:
+    df = df[df['unitsres'] == 1]
+
+# 4. Logic Filters (Remove Garbage Data)
 if 'sale_price' in df.columns:
-    df = df[df['sale_price'] > 10000]
+    df = df[df['sale_price'] > 10000] # Remove transfers < $10k
 if 'bldgarea' in df.columns:
-    df = df[df['bldgarea'] > 0]
+    df = df[df['bldgarea'] > 0]       # Remove 0 size
 if 'yearbuilt' in df.columns:
-    df = df[df['yearbuilt'] > 1800]
+    df = df[df['yearbuilt'] > 1800]   # Remove Year 0
 
-# 4. Drop rows with missing values in critical columns
-# FIX: Use 'cols_to_numeric' here instead of 'cols_to_fix'
-critical_cols = cols_to_numeric + ['latitude', 'longitude']
-existing_cols = [c for c in critical_cols if c in df.columns]
-df = df.dropna(subset=existing_cols)
+# 5. Drop NaNs
+df = df.dropna(subset=cols_to_numeric + ['borough_x'])
 
-# Clear all values that are null
-df.dropna(inplace = True)
-
-# Filter outliers with sales price (family transfers/inheritances)
-for x in df.index:
-  if df.loc[x, "sale_price"] <= 10:
-    df.drop(x, inplace = True)
-
-
-print(f"Cleaned Shape: {df.shape}")
+print(f"Cleaned Data Shape: {df.shape}")
 
 
 # ---------------------------------------------------------
-# Step 4: Run Linear Regression
+# Step 4: Feature Engineering (Making the Model Smart)
+# ---------------------------------------------------------
+# 1=Manhattan, 2=Bronx, 3=Brooklyn, 4=Queens, 5=Staten Island
+df['borough_x'] = df['borough_x'].astype(int).astype(str)
+
+# One-Hot Encoding: Turn "Borough" into columns (Is_Manhattan, Is_Bronx...)
+df_model = pd.get_dummies(df, columns=['borough_x'], drop_first=True)
+
+# Select Features: Size + Age + Location
+features = ['bldgarea', 'yearbuilt'] + [c for c in df_model.columns if 'borough_x_' in c]
+X = df_model[features]
+y = df_model['sale_price']
+
+# Split Data
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# ---------------------------------------------------------
+# Step 5: Train Gradient Boosting
 # ---------------------------------------------------------
 if not df.empty:
-    X = df[['bldgarea']]
-    y = df['sale_price']
-    
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    
-    model = LinearRegression()
-    model.fit(X_train, y_train)
+    print("\nTraining Gradient Boosting Model (this may take a moment)...")
+    gb_model = GradientBoostingRegressor(
+        n_estimators=200,  # More trees = smarter
+        learning_rate=0.05,
+        max_depth=5,       # Deeper trees
+        random_state=42
+    )
+    gb_model.fit(X_train, y_train)
 
-    print("\n--- Model Results ---")
-    print("Model trained successfully!")
-    print(f"Coefficient (Price per sqft): ${model.coef_[0]:.2f}")
+    # Predictions
+    y_pred = gb_model.predict(X_test)
     
-    # Visualization
+    # Metrics
+    mae = mean_absolute_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+    
+    print(f"Model Accuracy (R2 Score): {r2:.4f} (1.0 is perfect)")
+    print(f"Average Error: ${mae:,.0f}")
+
+    # ---------------------------------------------------------
+    # Step 6: Find "Steals" & Save Results
+    # ---------------------------------------------------------
+    results = pd.DataFrame({
+        'Actual_Price': y_test,
+        'Predicted_Value': y_pred,
+        'Bldg_Area': X_test['bldgarea'],
+        'Year_Built': X_test['yearbuilt']
+    })
+    
+    # "Potential Profit" = Predicted Value - Actual Price
+    results['Potential_Profit'] = results['Predicted_Value'] - results['Actual_Price']
+    
+    # Sort by biggest "Deals"
+    steals = results.sort_values(by='Potential_Profit', ascending=False).head(5)
+    
+    print("\n--- TOP 5 UNDEVALUED PROPERTIES (POTENTIAL STEALS) ---")
+    print(steals[['Actual_Price', 'Predicted_Value', 'Potential_Profit']])
+
+    # ---------------------------------------------------------
+    # Step 7: Visualizations
+    # ---------------------------------------------------------
+    
+    # Graph 1: Actual vs Predicted
     plt.figure(figsize=(10, 6))
-    plt.scatter(X_test, y_test, color='black', alpha=0.5, label='Actual Sales')
-    plt.plot(X_test, model.predict(X_test), color='blue', linewidth=3, label='Regression Line')
-    plt.title('Building Area vs Sale Price')
-    plt.xlabel('Building Area (sq ft)')
-    plt.ylabel('Sale Price ($)')
-    plt.legend()
+    plt.scatter(y_test, y_pred, alpha=0.5, color='purple', s=10)
+    p_min, p_max = min(y_test.min(), y_pred.min()), max(y_test.max(), y_pred.max())
+    plt.plot([p_min, p_max], [p_min, p_max], 'k--', lw=2, label='Perfect Prediction')
+    plt.xlabel('Actual Price ($)')
+    plt.ylabel('Predicted Price ($)')
+    plt.title('Accuracy Check: Actual vs Predicted')
+    plt.xscale('log')
+    plt.yscale('log')
     plt.grid(True, alpha=0.3)
+    plt.savefig("1_accuracy_check.png")
+    print("\nSaved '1_accuracy_check.png'")
+
+    # Graph 2: Feature Importance (What matters?)
+    importance = gb_model.feature_importances_
+    feat_names = X_train.columns
+    sorted_idx = np.argsort(importance)
     
-    # Save the plot
-    output_img = "housing_regression.png"
-    plt.savefig(output_img)
-    print(f"Plot saved to '{output_img}'")
-    
+    plt.figure(figsize=(10, 6))
+    plt.barh(range(len(sorted_idx)), importance[sorted_idx], align='center', color='teal')
+    plt.yticks(range(len(sorted_idx)), feat_names[sorted_idx])
+    plt.xlabel("Importance Score")
+    plt.title("What Drives House Prices in NYC?")
+    plt.tight_layout()
+    plt.savefig("2_feature_importance.png")
+    print("Saved '2_feature_importance.png'")
+
+    # Graph 3: Geospatial Heatmap
+    plt.figure(figsize=(10, 10))
+    sc = plt.scatter(df['longitude'], df['latitude'], 
+                     c=df['sale_price'], cmap='coolwarm', 
+                     s=10, alpha=0.7, 
+                     vmax=df['sale_price'].quantile(0.95)) # Cap at 95% to handle outliers
+    plt.colorbar(sc, label='Sale Price ($)')
+    plt.title("NYC Housing Price Map")
+    plt.xlabel("Longitude")
+    plt.ylabel("Latitude")
+    plt.grid(True, alpha=0.3)
+    plt.savefig("3_price_map.png")
+    print("Saved '3_price_map.png'")
+
+    # ---------------------------------------------------------
+    # Step 8: Interactive Price Predictor Tool
+    # ---------------------------------------------------------
+    def predict_my_house(sqft, year, borough_code):
+        """
+        Predicts price for a custom house.
+        borough_code: 1=Manhattan, 2=Bronx, 3=Brooklyn, 4=Queens, 5=Staten Island
+        """
+        # Create a dummy row with all zeros
+        input_data = pd.DataFrame(columns=X_train.columns)
+        input_data.loc[0] = 0 
+        
+        # Fill in user stats
+        input_data['bldgarea'] = sqft
+        input_data['yearbuilt'] = year
+        
+        # Handle Borough One-Hot Encoding
+        # Manhattan (1) is the baseline (all 0s). 
+        # For others, we set the specific column to 1.
+        col_name = f"borough_x_{borough_code}"
+        if col_name in input_data.columns:
+            input_data[col_name] = 1
+            
+        pred = gb_model.predict(input_data)[0]
+        
+        boro_names = {1: "Manhattan", 2: "Bronx", 3: "Brooklyn", 4: "Queens", 5: "Staten Island"}
+        b_name = boro_names.get(borough_code, "Unknown")
+        
+        print(f"\n--- CUSTOM PREDICTION ---")
+        print(f"House: {sqft} sqft | Year: {year} | Location: {b_name}")
+        print(f"Estimated Market Value: ${pred:,.2f}")
+
+    # --- RUN A TEST PREDICTION ---
+    # Example: 2,500 sqft house in Brooklyn (3), built in 1940
+    predict_my_house(sqft=2500, year=1940, borough_code=3)
+
 else:
-    print("Error: Dataset is empty after cleaning.")
+    print("Error: Dataset empty after cleaning.")
